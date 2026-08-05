@@ -152,7 +152,7 @@ private:
     static constexpr uint32_t MSIX_PBA_BIR   = 0;
     static constexpr uint32_t MSIX_TABLE_OFFSET = BAR0_MSIX_TABLE_OFF;
     static constexpr uint32_t MSIX_PBA_OFFSET   = BAR0_MSIX_PBA_OFF;
-    static constexpr uint32_t NUM_MSIX_VECTORS  = 1;
+    static constexpr uint32_t NUM_MSIX_VECTORS  = 2;
     static constexpr int VFIO_ATTACH_RETRY_US = 1000;
     static constexpr int VFIO_POLL_TIMEOUT_ATTACHED_MS = 1;
     static constexpr int VFIO_POLL_TIMEOUT_DETACHED_MS = 50;
@@ -180,6 +180,7 @@ private:
     bool entry_update_pending = false;
     bool fetch_update_pending = false;
     bool irq_pending = false;
+    bool irq_eoc_pending = false;
     bool reset_pending = false;
 
     PendingDma pending_dma;
@@ -305,6 +306,7 @@ void PCIeVfioMemBridge::reset(bool active)
         this->entry_update_pending = false;
         this->fetch_update_pending = false;
         this->irq_pending = false;
+        this->irq_eoc_pending = false;
         this->reset_pending = false;
         this->pending_dma = PendingDma();
         this->active_dma = PendingDma();
@@ -438,6 +440,7 @@ void PCIeVfioMemBridge::stop_vfio()
         this->entry_update_pending = false;
         this->fetch_update_pending = false;
         this->irq_pending = false;
+        this->irq_eoc_pending = false;
         this->reset_pending = false;
         this->pending_dma = PendingDma();
         this->active_dma = PendingDma();
@@ -891,12 +894,18 @@ void PCIeVfioMemBridge::dma_handler(vp::Block *__this, vp::ClockEvent *event)
 void PCIeVfioMemBridge::process_pending_irq()
 {
     bool trigger = false;
+    bool eoc_flag = false;
 
     {
         std::lock_guard<std::mutex> lock(this->mutex);
         trigger = this->irq_pending && !this->msix_vector0_masked && this->connected && this->vfu_ctx != nullptr;
         if (trigger) {
             this->irq_pending = false;
+        }
+
+        eoc_flag = this->irq_eoc_pending;
+        if (eoc_flag) {
+            this->irq_eoc_pending = false;
         }
     }
 
@@ -905,11 +914,21 @@ void PCIeVfioMemBridge::process_pending_irq()
     }
 
     errno = 0;
-    if (vfu_irq_trigger(this->vfu_ctx, 0) < 0) {
+    if (eoc_flag) {
+        if (vfu_irq_trigger(this->vfu_ctx, 1) < 0) {
         this->trace.warning("vfu_irq_trigger failed errno=%d\n", errno);
-    } else {
-        this->trace.msg(vp::Trace::LEVEL_DEBUG, "MSI-X vector0 triggered\n");
+        } else {
+        this->trace.msg(vp::Trace::LEVEL_DEBUG, "MSI-X vector1 triggered\n");
+        }
     }
+    else {
+        if (vfu_irq_trigger(this->vfu_ctx, 0) < 0) {
+        this->trace.warning("vfu_irq_trigger failed errno=%d\n", errno);
+        } else {
+        this->trace.msg(vp::Trace::LEVEL_DEBUG, "MSI-X vector0 triggered\n");
+        }
+    }
+    
 }
 
 /* React to the accelerator completion IRQ by disabling fetch and requesting a full reset. */
