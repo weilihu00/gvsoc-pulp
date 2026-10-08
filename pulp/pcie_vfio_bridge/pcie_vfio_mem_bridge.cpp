@@ -749,6 +749,7 @@ int PCIeVfioMemBridge::device_reset(vfu_ctx_t *vfu_ctx, vfu_reset_type_t type)
     bridge->fetch_update_pending = false;
     bridge->irq_pending = false;
     bridge->reset_pending = false;
+    bridge->irq_eoc_pending = false;
 
     return 0;
 }
@@ -892,49 +893,72 @@ void PCIeVfioMemBridge::dma_handler(vp::Block *__this, vp::ClockEvent *event)
 
 /* Emit a pending MSI-X interrupt once the VFIO transport is ready to accept it. */
 void PCIeVfioMemBridge::process_pending_irq()
-{
-    bool trigger = false;
-    bool eoc_flag = false;
+{   
+    bool trigger_dma = false;
+    bool trigger_eoc = false;
 
     {
         std::lock_guard<std::mutex> lock(this->mutex);
-        trigger = this->irq_pending && !this->msix_vector0_masked && this->connected && this->vfu_ctx != nullptr;
-        if (trigger) {
+
+        trigger_dma =
+            this->irq_pending &&
+            !this->msix_vector0_masked &&
+            this->connected &&
+            this->vfu_ctx != nullptr;
+
+        trigger_eoc =
+            this->irq_eoc_pending &&
+            this->connected &&
+            this->vfu_ctx != nullptr;
+
+        if (trigger_dma) {
             this->irq_pending = false;
         }
 
-        eoc_flag = this->irq_eoc_pending;
-        if (eoc_flag) {
+        if (trigger_eoc) {
             this->irq_eoc_pending = false;
         }
     }
 
-    if (!trigger) {
-        return;
+    if (trigger_eoc) {
+        errno = 0;
+
+        if (vfu_irq_trigger(this->vfu_ctx, 1) < 0)
+            this->trace.warning( "vfu_irq_trigger EOC failed errno=%d\n", errno); 
+        else {
+            this->trace.msg( vp::Trace::LEVEL_DEBUG, "MSI-X vector1 triggered\n");
+            {
+                std::lock_guard<std::mutex> lock(this->mutex);
+                this->reset_pending = true;
+            }
+
+            if (this->reset_event != nullptr && !this->reset_event->is_enqueued())
+                this->event_enqueue(this->reset_event, 1);
+
+        } 
     }
 
-    errno = 0;
-    if (eoc_flag) {
-        if (vfu_irq_trigger(this->vfu_ctx, 1) < 0) {
-        this->trace.warning("vfu_irq_trigger failed errno=%d\n", errno);
-        } else {
-        this->trace.msg(vp::Trace::LEVEL_DEBUG, "MSI-X vector1 triggered\n");
-        }
-    }
-    else {
+    if (trigger_dma) {
+        errno = 0;
+
         if (vfu_irq_trigger(this->vfu_ctx, 0) < 0) {
-        this->trace.warning("vfu_irq_trigger failed errno=%d\n", errno);
+            this->trace.warning(
+                "vfu_irq_trigger DMA failed errno=%d\n",
+                errno);
         } else {
-        this->trace.msg(vp::Trace::LEVEL_DEBUG, "MSI-X vector0 triggered\n");
+            this->trace.msg(
+                vp::Trace::LEVEL_DEBUG,
+                "MSI-X vector0 triggered\n");
         }
     }
-    
 }
 
 /* React to the accelerator completion IRQ by disabling fetch and requesting a full reset. */
 void PCIeVfioMemBridge::done_req(vp::Block *__this, bool active)
 {
-    PCIeVfioMemBridge *_this = static_cast<PCIeVfioMemBridge *>(__this);
+    PCIeVfioMemBridge *_this =
+        static_cast<PCIeVfioMemBridge *>(__this);
+
     if (!active) {
         return;
     }
@@ -944,11 +968,7 @@ void PCIeVfioMemBridge::done_req(vp::Block *__this, bool active)
 
     {
         std::lock_guard<std::mutex> lock(_this->mutex);
-        _this->reset_pending = true;
-    }
-
-    if (_this->reset_event != nullptr && !_this->reset_event->is_enqueued()) {
-        _this->event_enqueue(_this->reset_event, 1);
+        _this->irq_eoc_pending = true;
     }
 }
 
@@ -1107,6 +1127,7 @@ void PCIeVfioMemBridge::vfio_server_thread()
                 this->dma_inflight = false;
                 this->irq_pending = false;
                 this->reset_pending = false;
+                this->irq_eoc_pending = false;
                 this->dma_mappings.clear();
                 this->write32_nolock(BAR0_DMA_STATUS, 0);
                 this->write32_nolock(BAR0_DMA_ERROR, DMA_ERR_NONE);
