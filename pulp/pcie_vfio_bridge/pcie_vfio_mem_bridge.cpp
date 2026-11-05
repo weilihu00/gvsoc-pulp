@@ -85,6 +85,17 @@ private:
         bool is_write = false;
     };
 
+    struct DmaChannel {
+        PendingDma pending;
+        PendingDma active;
+        ActiveDmaState active_state;
+
+        bool inflight = false;
+
+        vp::IoReq req;
+        vp::ClockEvent *event = nullptr;
+    };
+
     struct __attribute__((packed)) MsixCap {
         uint8_t cap_id;
         uint8_t next;
@@ -101,6 +112,7 @@ private:
     };
 
     enum : uint64_t {
+        //DMA channel 0 registers
         BAR0_DMA_SRC_ADDR_LO = 0x00,
         BAR0_DMA_SRC_ADDR_HI = 0x04,
         BAR0_DMA_DST_ADDR_LO = 0x08,
@@ -115,6 +127,17 @@ private:
         BAR0_FETCH_ENABLE    = 0x2C,
         BAR0_MSIX_TABLE_OFF  = 0x40,
         BAR0_MSIX_PBA_OFF    = 0x80,
+        // DMA channel 1 registers
+        BAR0_DMA1_SRC_ADDR_LO = 0x90,
+        BAR0_DMA1_SRC_ADDR_HI = 0x94,
+        BAR0_DMA1_DST_ADDR_LO = 0x98,
+        BAR0_DMA1_DST_ADDR_HI = 0x9C,
+        BAR0_DMA1_LEN         = 0xA0,
+        BAR0_DMA1_CTRL        = 0xA4,
+        BAR0_DMA1_STATUS      = 0xA8,
+        BAR0_DMA1_ERROR       = 0xAC,
+        BAR0_DMA1_MAGIC       = 0xB0,
+        BAR0_DMA1_DIRECTION   = 0xB4,
     };
 
     enum : uint32_t {
@@ -183,6 +206,8 @@ private:
     bool irq_eoc_pending = false;
     bool reset_pending = false;
 
+    DmaChannel dma_channels[2];
+    //
     PendingDma pending_dma;
     PendingDma active_dma;
     ActiveDmaState active_dma_state;
@@ -266,6 +291,13 @@ PCIeVfioMemBridge::PCIeVfioMemBridge(vp::ComponentConf &conf)
     this->kick_event = this->event_new(&PCIeVfioMemBridge::kick_handler);
     this->reset_event = this->event_new(&PCIeVfioMemBridge::reset_handler);
     this->dma_event = this->event_new(&PCIeVfioMemBridge::dma_handler);
+
+    // DMA channel 0 and 1 events
+    this->dma_channels[0].event =
+        this->event_new(&PCIeVfioMemBridge::dma_handler);
+
+    this->dma_channels[1].event =
+        this->event_new(&PCIeVfioMemBridge::dma_handler);
 }
 
 /* Stop background activity and release VFIO resources when the component is destroyed. */
@@ -299,6 +331,14 @@ void PCIeVfioMemBridge::reset(bool active)
     if (!active) {
         if (this->dma_event->is_enqueued()) {
             this->event_cancel(this->dma_event);
+        }
+
+        // Cancel pending events for both DMA channels
+        for (auto &channel : this->dma_channels) {
+            if (channel.event != nullptr &&
+                channel.event->is_enqueued()) {
+                this->event_cancel(channel.event);
+            }
         }
 
         std::lock_guard<std::mutex> lock(this->mutex);
@@ -432,6 +472,14 @@ void PCIeVfioMemBridge::stop_vfio()
         this->event_cancel(this->dma_event);
     }
 
+    // Cancel pending events for both DMA channels
+    for (auto &channel : this->dma_channels) {
+        if (channel.event != nullptr &&
+            channel.event->is_enqueued()) {
+            this->event_cancel(channel.event);
+        }
+    }
+
     {
         std::lock_guard<std::mutex> lock(this->mutex);
         local_ctx = this->vfu_ctx;
@@ -446,6 +494,12 @@ void PCIeVfioMemBridge::stop_vfio()
         this->active_dma = PendingDma();
         this->active_dma_state = ActiveDmaState();
         this->dma_inflight = false;
+        for (auto &channel : this->dma_channels) {
+            channel.pending = PendingDma();
+            channel.active = PendingDma();
+            channel.active_state = ActiveDmaState();
+            channel.inflight = false;
+        }
         this->dma_mappings.clear();
     }
 
@@ -504,6 +558,14 @@ void PCIeVfioMemBridge::reset_registers_nolock()
     this->active_dma_state = ActiveDmaState();
     this->dma_inflight = false;
     this->msix_vector0_masked = false;
+
+    // Reset both DMA channel states
+    for (auto &channel : this->dma_channels) {
+        channel.pending = PendingDma();
+        channel.active = PendingDma();
+        channel.active_state = ActiveDmaState();
+        channel.inflight = false;
+    }
 }
 
 /* Clear DMA completion/error bits before accepting a new transfer. */
